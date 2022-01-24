@@ -1,0 +1,26 @@
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "type": "lldb",
+            "request": "launch",
+            "name": "Cargo launch",
+            "cargo": {
+                "args": [
+                    "build",
+                    // "--dev"
+                ]
+            },
+            "program": "${cargo:program}",
+            // "env" : {"EGTB": "./egtb-test"},
+            // "args": ["play", "7R/8/8/6k1/q7/8/3K4/8 b - - 0 1"]
+            // "args": ["move", "8/8/8/8/8/8/n1K5/k1B5 w - - 0 1"]
+            "args": ["gen", "KQ-KP"]
+            // "args": ["test-loosers", "KP-K", "KR-K"]
+        }
+    ],
+    "plappernicht" : true
+}
