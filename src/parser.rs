@@ -1,4 +1,5 @@
 use std::borrow::Borrow;
+use std::fmt::Display;
 use std::rc::Rc;
 use std::str::from_utf8;
 
@@ -159,8 +160,24 @@ pub trait StrParser<R, E>: Parser<u8, R, E> {
     fn parse_str_raw(&self, src: &str) -> (usize, Result<R, E>) {
         self.parse_raw(src.as_bytes())
     }
-    fn parse_str(&self, src: &str) -> Result<R, E> {
-        self.parse(src.as_bytes())
+    fn parse_str(&self, src: &str) -> Result<R, String>
+    where
+        E: Display,
+    {
+        match self.parse_str_raw(src) {
+            (_, Ok(v)) => Ok(v),
+            (u, Err(e)) => {
+                let v = (u + 8).min(src.len());
+                let dots = if v < src.len() { "………" } else { "" };
+                Err(format!(
+                    "{} at offset {}, found \"{}{}\"",
+                    e,
+                    u,
+                    &src[u..v],
+                    dots
+                ))
+            }
+        }
     }
 }
 
@@ -230,8 +247,37 @@ where
     /// Otherwise, the value produced by `p` is passed to the closure, which must construct another parser
     /// whose result is the overall one, be it failure or success.
     ///
-    /// Very useful for combining the results of several parsers.
+    /// This is very useful for combining the results of several parsers. The `then`, `and` and `before` functions
+    /// are written in terms of `and_then`.
     ///
+    /// In addition, `and_then` is important for construction of recursive parsers.
+    /// Recursive parsers can only be build in functions, because parsers cannot be static or const items
+    /// and local definitions cannot reference themselves. It is important to note that the recursion must
+    /// only take place in a closure, otherwise mere construction of the parser would immediately overrun
+    /// the stack. Here is an example of a parser that accepts a number of opening parentheses followed by
+    /// the same number of closing parentheses:
+    ///
+    /// ```
+    /// pub fn expr() -> GenericP<u8, (), String> {
+    ///    expect('(').and_then(|_| expr()).before(expect(')'))
+    ///    .or(pure(()))
+    /// }
+    /// ```
+    ///
+    /// We must not simply use `then` in place of `and_then` because there is nothing that would stop recursion in the construction phase.
+    /// Instead, the next instance of the parser will be built lazily only after parsing is already going on **and**
+    /// an opening parenthesis has already been consumed. This way, the recursion is limited by the number of opening parentheses present
+    /// at the start of the input sequence.
+    ///
+    /// A correct recursive parser must consume some input before every recursion.
+    /// This cannot be enforced statically at compile time. An example of a bad recursive parser would be:
+    /// ```
+    /// pub fn bad_recursion() -> GenericP<u8, (), String> {
+    ///     spaces().and_then(|_| bad_recursion())
+    /// }
+    /// ```
+    ///
+    /// Since `spaces()` can succeed without consuming anything, the recursion will go on forever even when parsing an empty string.
     pub fn and_then<T>(&self, f: impl Fn(R) -> GenericP<S, T, E> + 'static) -> GenericP<S, T, E>
     where
         T: 'static,
@@ -249,7 +295,7 @@ where
     /// `p.then(q)` is an abbrevation for `p.and_then(|_| q)`.
     /// The value produced by `p` is (intentionally) lost.
     /// If you want to keep both values, use `p.and(q)`.
-    /// If you want only the value of `q`, use `p.before(q)`
+    /// If you want only the value of `p`, use `p.before(q)`
     ///
     /// Here is an inspiring example, where we assume that `expr` parses some expression:
     /// ```
@@ -278,19 +324,15 @@ where
         T: Copy,
     {
         let q = r.borrow().clone();
-        self.and_then(move |pv| q.and_then(move |qv| pure((pv, qv))))
-        // let p = GenericP {
-        //     run: Box::new(self.run),
-        // };
-        // GenericP {
-        //     run: Box::new(move |array| match (p.run)(array) {
-        //         (u, Ok(a)) => match (r.run)(&array[u..]) {
-        //             (v, Ok(b)) => (u + v, Ok((a, b))),
-        //             (v, Err(e)) => (u + v, Err(e)),
-        //         },
-        //         (u, Err(e)) => (u, Err(e)),
-        //     }),
-        // }
+        // self.and_then(move |pv| q.and_then(move |qv| pure((pv, qv))))
+        let p = self.clone();
+        GenericP::new(move |array| match (p.run)(array) {
+            (u, Ok(a)) => match (q.run)(&array[u..]) {
+                (v, Ok(b)) => (u + v, Ok((a, b))),
+                (v, Err(e)) => (u + v, Err(e)),
+            },
+            (u, Err(err)) => (u, Err(err)),
+        })
     }
 
     ///
@@ -305,10 +347,19 @@ where
     pub fn before<T>(&self, r: impl Borrow<GenericP<S, T, E>>) -> GenericP<S, R, E>
     where
         T: 'static,
-        R: Copy,
+        E: 'static,
+        R: 'static,
     {
+        // self.and_then(move |pv| q.and_then(move |_| pure(pv.clone())))
+        let p = self.clone();
         let q = r.borrow().clone();
-        self.and_then(move |pv| q.and_then(move |_| pure(pv)))
+        GenericP::new(move |array| match (p.run)(array) {
+            (u, Ok(a)) => match (q.run)(&array[u..]) {
+                (v, Ok(_b)) => (u + v, Ok(a)),
+                (v, Err(e)) => (u + v, Err(e)),
+            },
+            (u, Err(err)) => (u, Err(err)),
+        })
     }
 
     /// `p.or(q)`
@@ -337,7 +388,7 @@ where
         })
     }
 
-    /// `p.map_err(f)` maps the error value when `p` fails.
+    /// `p.map_err(f)` maps the error value when `p` fails. This is a more powerful variant of `p.label(str)`.
     pub fn map_err<F>(&self, f: impl Fn(E) -> F + 'static) -> GenericP<S, R, F>
     where
         F: 'static,
@@ -346,6 +397,80 @@ where
         GenericP::new(move |array| match (p.run)(array) {
             (u, Ok(v)) => (u, Ok(v)),
             (u, Err(e)) => (u, Err(f(e))),
+        })
+    }
+
+    /// `p.optional()` turns `p` into a parser that always succeeds.
+    /// When `p` succeeds, it wraps the result in `Some`, otherwise it returns `None`.
+    pub fn optional(&self) -> GenericP<S, Option<R>, E> {
+        let p = self.clone();
+        GenericP::new(move |array| match (p.run)(array) {
+            (u, Ok(v)) => (u, Ok(Some(v))),
+            (u, Err(_)) => (u, Ok(None)),
+        })
+    }
+
+    /// `p.many(s)` succeeds always and returns a vector instead of a single value.
+    /// It can be used to parse a list of `p`s separated by `s`. `s` can be a parser like `pure(())` that consumes nothing
+    /// and suceeds always if there is no separator.
+    /// It attempts `p` first and then subsequently `s.then(p)` until it fails and collects the success values in a vector.
+    ///
+    /// `p` and `s.then(p)` must not be both parsers that do never fail or the parsing will not terminate.
+    /// For example, `p.optional().many(pure(()))` will fill up your memory with `None`s.
+    pub fn many<T>(&self, s: impl Borrow<GenericP<S, T, E>>) -> GenericP<S, Vec<R>, E>
+    where
+        T: 'static,
+    {
+        let p = self.clone();
+        let q = s.borrow().clone().then(p.clone());
+        GenericP::new(move |array| {
+            let mut vs = Vec::new();
+            let mut n = 0usize;
+            loop {
+                let pq = if vs.len() == 0 { &p } else { &q };
+                match (pq.run)(&array[n..]) {
+                    (u, Ok(v)) => {
+                        n += u;
+                        vs.push(v);
+                    }
+                    (u, Err(_)) => return (n + u, Ok(vs)),
+                }
+            }
+        })
+    }
+
+    /// `p.some(s)` is like `p.many(s)`, but it turns a success with empty vector into a failure.
+    /// This is so that after `p.some(s)` succeeds, there is at least one element in the result vector.
+    pub fn some<T>(&self, s: impl Borrow<GenericP<S, T, E>>) -> GenericP<S, Vec<R>, E>
+    where
+        T: 'static,
+    {
+        let p = self.clone();
+        let q = s.borrow().clone().then(p.clone());
+        GenericP::new(move |array| {
+            let mut vs = Vec::new();
+            let mut n = 0usize;
+
+            match (p.run)(array) {
+                (u, Ok(first)) => {
+                    vs.push(first);
+                    n += u;
+                    loop {
+                        match (q.run)(&array[n..]) {
+                            (u, Ok(other)) => {
+                                vs.push(other);
+                                n += u;
+                            }
+                            _ => {
+                                // n += u;
+                                break;
+                            }
+                        }
+                    }
+                    (n, Ok(vs))
+                }
+                (u, Err(e)) => (u, Err(e)),
+            }
         })
     }
 }
@@ -358,12 +483,6 @@ impl<S, R, E> Parser<S, R, E> for GenericP<S, R, E> {
 
 impl<R, E> StrParser<R, E> for GenericP<u8, R, E> {}
 
-pub fn map_result<R, E, T>(r: ParseResult<R, E>, f: impl Fn(R) -> T) -> ParseResult<T, E> {
-    match r {
-        (u, re) => (u, re.map(f)),
-    }
-}
-
 // ------------------------- primitive parsers -----------------------------------------
 
 /// A parser that always succeeds and returns the supplied value.
@@ -374,18 +493,25 @@ where
     R: Copy + 'static,
     E: 'static,
 {
-    let w = v;
-    GenericP::new(move |_| (0, Ok(w)))
+    GenericP::new(move |_| (0, Ok(v)))
 }
 
-/// A parser that always fails without consuming anything. The error contains the supplied value.
-pub fn fail<S, R, E>(e: E) -> GenericP<S, R, E>
+/// Another way to write pure(()). Can be used as argument for `many` or `some`
+pub fn without_separator<S, E>() -> GenericP<S, (), E>
+where
+    S: 'static,
+    E: 'static,
+{
+    pure(())
+}
+
+/// A parser that always fails without consuming anything. The error contains the supplied (String) value.
+pub fn fail<S, R>(e: &'static str) -> GenericP<S, R, String>
 where
     S: 'static,
     R: 'static,
-    E: Copy + 'static,
 {
-    GenericP::new(move |_| (0, Err(e)))
+    GenericP::new(move |_| (0, Err(e.to_string())))
 }
 ///
 /// A parser that succeeds if and only if the source slice is empty.
@@ -399,7 +525,7 @@ where
 /// Useful in constructs like
 ///
 /// ```
-/// my_grammar.before(GenericP::end_of_input())
+/// my_grammar.before(end_of_input())
 /// ```
 ///
 /// where `my_grammar` would be some top level parser.
@@ -443,7 +569,7 @@ pub fn expect(c: char) -> GenericP<u8, char, String> {
     }
 }
 
-/// Succeeds when the next character satisfies the given predicate and gives that character as result.
+/// Build a parser that will succeed when the next character satisfies the given predicate and gives that character as result.
 ///
 /// Fails on end of input or when the character fails the predicate, in which case nothing is consumed.
 pub fn satisfy(f: impl Fn(char) -> bool + 'static) -> GenericP<u8, char, String> {
@@ -455,6 +581,105 @@ pub fn satisfy(f: impl Fn(char) -> bool + 'static) -> GenericP<u8, char, String>
             Some(_) => (0, Err("no match".to_string())),
         },
     })
+}
+
+/// Create a parser that consumes characters as long as they satisfy a predicate, or until the end of input is reached.
+/// Such a parser always suceeds and returns ().
+pub fn skip<E>(f: impl Fn(char) -> bool + 'static) -> GenericP<u8, (), E>
+where
+    E: 'static,
+{
+    GenericP::new(move |array| {
+        let mut u = 0usize;
+        match from_utf8(array) {
+            Err(_utf8) => (0, Ok(())),
+            Ok(str) => {
+                for ch in str.chars() {
+                    if f(ch) {
+                        u += ch.len_utf8();
+                    } else {
+                        break;
+                    }
+                }
+                (u, Ok(()))
+            }
+        }
+    })
+}
+
+/// Like skip, but collects the matched characters and returns them as a string.
+/// Fails when no characters matched at all.
+pub fn take(f: impl Fn(char) -> bool + 'static) -> GenericP<u8, String, String> {
+    GenericP::new(move |array| {
+        let mut u = 0usize;
+        match from_utf8(array) {
+            Err(utf8) => (0, Err(format!("{}", utf8))),
+            Ok(str) => {
+                for ch in str.chars() {
+                    if f(ch) {
+                        u += ch.len_utf8();
+                    } else {
+                        break;
+                    }
+                }
+                if u > 0 {
+                    (u, Ok(str[0..u].to_string()))
+                } else {
+                    (0, Err("no matches".to_string()))
+                }
+            }
+        }
+    })
+}
+
+/// Succeeds if the next character is a space character and returns it. Otherwise fails.
+pub fn space() -> GenericP<u8, char, String> {
+    satisfy(|c| c.is_whitespace()).label("whitespace expected")
+}
+
+/// Succeeds always and skips any number of whitespace, if any.
+pub fn spaces<E>() -> GenericP<u8, (), E>
+where
+    E: 'static,
+{
+    skip(|c| c.is_whitespace())
+}
+
+#[test]
+pub fn sum_of_digits() {
+    let ascii_digit = satisfy(|d| d.is_ascii_digit())
+        .label("digit expected")
+        .map(|d| d as i32 - '0' as i32);
+    let sign = expect('-')
+        .optional()
+        .map(|x| if x.is_some() { -1 } else { 1 });
+    let decimal = ascii_digit
+        .some(pure(true))
+        .label("decimal number expected")
+        .map(|vs| vs.iter().fold(0, |acc, d| acc * 10 + d));
+    let signed = sign.and_then(move |s| decimal.map(move |d| d * s));
+    let numberlist = signed
+        .some(space())
+        .label("number expected")
+        .map(|vs| vs.iter().fold(0, |a, b| a + b));
+    for xs in ["", "1", "4 5 -3", "1234 5678 -9000x", "123456789 18 22 -42"] {
+        let result = numberlist.parse_str_raw(xs);
+        // println!("result1: {:?}", result1);
+
+        println!(
+            "numberlist \"{}\", result {:?}, rest: \"{}\"",
+            xs,
+            result.1,
+            &xs[result.0..]
+        );
+    }
+
+    let result2: Result<Vec<i32>, String> = Ok(vec![123456789, 18, 22, -42]);
+    println!("result2: {:?}", result2);
+    println!(
+        "mapped2: {:?}",
+        result2.map(|vs| vs.iter().fold(0, |a, b| a * 1 + b))
+    );
 }
 
 #[test]
@@ -518,4 +743,39 @@ pub fn test() {
     println!("{:?}", dc.parse_str_raw("dc"));
     println!("{:?}", dc.parse_str_raw("?!"));
     println!("{:?}", dc.parse_str_raw(""));
+    for ex in [
+        "",
+        "(",
+        ")",
+        "x",
+        "()",
+        "(()",
+        "()))))",
+        "(((((((((()))))))))",
+        "(((((((((())))))))))",
+    ] {
+        println!(
+            "{:?}  {:?}",
+            expr().before(end_of_input()).parse_str_raw(ex),
+            ex
+        );
+    }
+    let text = "Dieser Satz besteht aus sechs Wörtern.";
+    print!("text \"{}\"   ", text);
+    match take(|c| c.is_alphabetic()).many(spaces()).parse_str(text) {
+        Ok(v) => println!("{:?}", v),
+        Err(e) => println!("{}", e),
+    }
+}
+
+/// example parser for ((()))
+pub fn expr() -> GenericP<u8, (), String> {
+    expect('(')
+        .and_then(|_| expr())
+        .before(expect(')'))
+        .or(pure(()))
+}
+
+pub fn bad_recursion() -> GenericP<u8, (), String> {
+    pure(true).and_then(|_| bad_recursion())
 }
