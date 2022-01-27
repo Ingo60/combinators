@@ -1,7 +1,8 @@
-use std::borrow::Borrow;
 use std::fmt::Display;
+use std::ops::Sub;
 use std::rc::Rc;
 use std::str::from_utf8;
+use std::{borrow::Borrow, str::FromStr};
 
 pub trait Parser<S, R, E> {
     /// Run a parser. The result is a tuple, whose first component
@@ -152,9 +153,9 @@ pub trait Parser<S, R, E> {
 ///
 /// Here, the parser did consume the leading 'e' and got stuck "inside" the unicode 'è'.
 ///
-/// ## Conclusion
-///
-///
+
+pub const YELLOW: &str = "\x1b\x5b32m";
+pub const NORMAL: &str = "\x1b\x5b0m";
 
 pub trait StrParser<R, E>: Parser<u8, R, E> {
     fn parse_str_raw(&self, src: &str) -> (usize, Result<R, E>) {
@@ -167,14 +168,30 @@ pub trait StrParser<R, E>: Parser<u8, R, E> {
         match self.parse_str_raw(src) {
             (_, Ok(v)) => Ok(v),
             (u, Err(e)) => {
-                let v = (u + 8).min(src.len());
+                // eprintln!("{}bytes {:?}{}", YELLOW, src.as_bytes(), NORMAL);
+                let mut v = u;
+                for c in src[u..].chars() {
+                    v += c.len_utf8();
+                    if v >= u + 8 {
+                        break;
+                    }
+                }
+
                 let dots = if v < src.len() { "………" } else { "" };
+                let quot = if u < src.len() { "\"" } else { "" };
+                let rest = if u < src.len() {
+                    &src[u..v]
+                } else {
+                    "end of input"
+                };
                 Err(format!(
-                    "{} at offset {}, found \"{}{}\"",
+                    "{} at position {}, found {}{}{}{}",
                     e,
-                    u,
-                    &src[u..v],
-                    dots
+                    u + 1,
+                    quot,
+                    rest,
+                    dots,
+                    quot,
                 ))
             }
         }
@@ -388,6 +405,47 @@ where
         })
     }
 
+    /// `p.map_result(f)` can be useful when the mapping function itself returns a `Result`.
+    /// It works like this:
+    /// - When `p` fails, the whole construct fails with the error of `p`.
+    /// - Otherwise, `f` is applied to the result of `p` and the result is lifted to the parser monad, i.e. when it is `Ok(v)`
+    /// then `v` is the result of the construct and when it is `Err(e)` the whole construct fails with this error.
+    ///
+    /// For this to work it is necessary that the error type of `f` equals that of `p`.
+    /// This can be achieved by using map_err either for `p` or inside `f`.
+    pub fn map_result<T>(&self, f: impl Fn(R) -> Result<T, E> + 'static) -> GenericP<S, T, E>
+    where
+        T: 'static,
+    {
+        let p = self.clone();
+        GenericP::new(move |array| match (p.run)(array) {
+            (u, Ok(v)) => (u, f(v)),
+            (u, Err(e)) => (u, Err(e)),
+        })
+    }
+
+    /// `p.map_option(f)` is useful when the mapping function `f` returns an `Option`. It makes the outcome of the whole construct
+    /// depend on the result of `f`. Namely, when it is `None`, the parser fails and when it is `Some(v)` the parser suceeds with the
+    /// value `v`.
+    ///
+    /// For this to work, the error type of `p` must implement `Default`.
+    /// The default value will be the error information in the `None` case.
+    /// However, if `p` itself fails, its error will be passed on.
+    pub fn map_option<T>(&self, f: impl Fn(R) -> Option<T> + 'static) -> GenericP<S, T, E>
+    where
+        T: 'static,
+        E: Default,
+    {
+        let p = self.clone();
+        GenericP::new(move |array| match (p.run)(array) {
+            (u, Ok(v)) => match f(v) {
+                Some(r) => (u, Ok(r)),
+                None => (u, Err(E::default())),
+            },
+            (u, Err(e)) => (u, Err(e)),
+        })
+    }
+
     /// `p.map_err(f)` maps the error value when `p` fails. This is a more powerful variant of `p.label(str)`.
     pub fn map_err<F>(&self, f: impl Fn(E) -> F + 'static) -> GenericP<S, R, F>
     where
@@ -410,14 +468,14 @@ where
         })
     }
 
-    /// `p.many(s)` succeeds always and returns a vector instead of a single value.
+    /// `p.many_sep_by(s)` succeeds always and returns a vector instead of a single value.
     /// It can be used to parse a list of `p`s separated by `s`. `s` can be a parser like `pure(())` that consumes nothing
     /// and suceeds always if there is no separator.
-    /// It attempts `p` first and then subsequently `s.then(p)` until it fails and collects the success values in a vector.
+    /// It attempts `p` first and then subsequently `s.then(p)` until the first fail and collects the success values in a vector.
     ///
     /// `p` and `s.then(p)` must not be both parsers that do never fail or the parsing will not terminate.
-    /// For example, `p.optional().many(pure(()))` will fill up your memory with `None`s.
-    pub fn many<T>(&self, s: impl Borrow<GenericP<S, T, E>>) -> GenericP<S, Vec<R>, E>
+    /// For example, `p.optional().many_sep_by(pure(()))` will fill up your memory with `None`s.
+    pub fn many_sep_by<T>(&self, s: impl Borrow<GenericP<S, T, E>>) -> GenericP<S, Vec<R>, E>
     where
         T: 'static,
     {
@@ -439,9 +497,9 @@ where
         })
     }
 
-    /// `p.some(s)` is like `p.many(s)`, but it turns a success with empty vector into a failure.
+    /// `p.some_sep_by(s)` is like `p.many_sep_by(s)`, but it insists on at least one match of `p`, failing when the initial `p` does.
     /// This is so that after `p.some(s)` succeeds, there is at least one element in the result vector.
-    pub fn some<T>(&self, s: impl Borrow<GenericP<S, T, E>>) -> GenericP<S, Vec<R>, E>
+    pub fn some_sep_by<T>(&self, s: impl Borrow<GenericP<S, T, E>>) -> GenericP<S, Vec<R>, E>
     where
         T: 'static,
     {
@@ -473,6 +531,63 @@ where
             }
         })
     }
+
+    /// `p.some()` is short for `p.some_sep_by(pure(()))`
+    pub fn some(&self) -> GenericP<S, Vec<R>, E> {
+        self.some_sep_by(pure(()))
+    }
+
+    /// `p.many()` is short for `p.many_sep_by(pure(()))`
+    pub fn many(&self) -> GenericP<S, Vec<R>, E> {
+        self.many_sep_by(pure(()))
+    }
+
+    /// `p.guard(|v| -> bool {...})` fails when `p` fails
+    /// or when the supplied function evaluates to **false**
+    /// when it is applied to
+    /// the return value of `p`.
+    /// Returns the value of `p` when `p` succeeds and the guard condition evaluates to **true**
+    ///
+    /// Restrictions: the error type of `p` must implement `Default`. This default error value is
+    /// returned when the giard fails. It is thus advised to `map_err` the error information or to `label` it.
+    ///
+    /// In addition, the return value of `p` must implement `Clone`.
+    pub fn guard(&self, f: impl Fn(R) -> bool + 'static) -> GenericP<S, R, E>
+    where
+        E: Default,
+        R: Clone,
+    {
+        let p = self.clone();
+        GenericP::new(move |array| match (p.run)(array) {
+            (u, Ok(ok)) => {
+                if f(ok.clone()) {
+                    (u, Ok(ok))
+                } else {
+                    (u, Err(E::default()))
+                }
+            }
+            e => e,
+        })
+    }
+
+    /// `p.when("xy")` is a more convenient way to guard the result of String valued parsers.
+    pub fn when(&self, expected: &'static str) -> GenericP<S, String, String>
+    where
+        R: Borrow<String>,
+        E: Display,
+    {
+        let p = self.clone();
+        GenericP::new(move |array| match (p.run)(array) {
+            (u, Ok(v)) => {
+                if v.borrow() == expected {
+                    (u, Ok(v.borrow().clone()))
+                } else {
+                    (u, Err(format!("{:?} expected", expected)))
+                }
+            }
+            (u, Err(e)) => (u, Err(format!("{}", e))),
+        })
+    }
 }
 
 impl<S, R, E> Parser<S, R, E> for GenericP<S, R, E> {
@@ -494,15 +609,6 @@ where
     E: 'static,
 {
     GenericP::new(move |_| (0, Ok(v)))
-}
-
-/// Another way to write pure(()). Can be used as argument for `many` or `some`
-pub fn without_separator<S, E>() -> GenericP<S, (), E>
-where
-    S: 'static,
-    E: 'static,
-{
-    pure(())
 }
 
 /// A parser that always fails without consuming anything. The error contains the supplied (String) value.
@@ -584,7 +690,9 @@ pub fn satisfy(f: impl Fn(char) -> bool + 'static) -> GenericP<u8, char, String>
 }
 
 /// Create a parser that consumes characters as long as they satisfy a predicate, or until the end of input is reached.
-/// Such a parser always suceeds and returns ().
+/// `skip` always suceeds and returns ().
+///
+/// `skip(f)` behaves like `satisfy(f).many().then(pure(()))` but without construction of the intermediate vector.
 pub fn skip<E>(f: impl Fn(char) -> bool + 'static) -> GenericP<u8, (), E>
 where
     E: 'static,
@@ -607,7 +715,9 @@ where
     })
 }
 
-/// Like skip, but collects the matched characters and returns them as a string.
+/// `take(f)` collects the matched characters and returns them as a string.
+/// The difference to `satisfy(f).some()` is the return type (`String` vs. `Vec<char>`)
+///
 /// Fails when no characters matched at all.
 pub fn take(f: impl Fn(char) -> bool + 'static) -> GenericP<u8, String, String> {
     GenericP::new(move |array| {
@@ -637,7 +747,7 @@ pub fn space() -> GenericP<u8, char, String> {
     satisfy(|c| c.is_whitespace()).label("whitespace expected")
 }
 
-/// Succeeds always and skips any number of whitespace, if any.
+/// Skips any number of whitespace characters. Suceeds even when there were none.
 pub fn spaces<E>() -> GenericP<u8, (), E>
 where
     E: 'static,
@@ -645,22 +755,50 @@ where
     skip(|c| c.is_whitespace())
 }
 
+pub fn digit<U>() -> GenericP<u8, U, String>
+where
+    U: From<char> + Sub<Output = U> + 'static,
+{
+    satisfy(|d| d.is_ascii_digit())
+        .label("digit expected")
+        .map(|d| U::from(d) - U::from('0'))
+}
+
+/// Generates a parser to parse a number. The number type is generic and must possibly be supplied:
+/// > number<i16>()
+///
+/// Note that the result type is only required to implement `FromStr`.
+pub fn unsigned<T>() -> GenericP<u8, T, String>
+where
+    T: FromStr + 'static,
+{
+    take(|d| d.is_ascii_digit()).map_result(|s| {
+        s.parse()
+            .map_err(|_| "number parse error (too many digits?)".to_string())
+    })
+}
+
 #[test]
 pub fn sum_of_digits() {
+    let _p_float = unsigned::<f64>();
+    let _any_digit = digit::<u64>();
     let ascii_digit = satisfy(|d| d.is_ascii_digit())
         .label("digit expected")
-        .map(|d| d as i32 - '0' as i32);
+        .map(|d| u32::from(d) - u32::from('0'));
     let sign = expect('-')
         .optional()
         .map(|x| if x.is_some() { -1 } else { 1 });
     let decimal = ascii_digit
-        .some(pure(true))
+        .some()
         .label("decimal number expected")
         .map(|vs| vs.iter().fold(0, |acc, d| acc * 10 + d));
-    let signed = sign.and_then(move |s| decimal.map(move |d| d * s));
+    let signed = sign.and_then(move |s| decimal.map(move |d| d as i32 * s));
     let numberlist = signed
-        .some(space())
+        .some_sep_by(space())
         .label("number expected")
+        .map(|vs| vs.iter().fold(0, |a, b| a + b));
+    let uns_list = unsigned::<u16>()
+        .some_sep_by(spaces())
         .map(|vs| vs.iter().fold(0, |a, b| a + b));
     for xs in ["", "1", "4 5 -3", "1234 5678 -9000x", "123456789 18 22 -42"] {
         let result = numberlist.parse_str_raw(xs);
@@ -672,14 +810,15 @@ pub fn sum_of_digits() {
             result.1,
             &xs[result.0..]
         );
-    }
 
-    let result2: Result<Vec<i32>, String> = Ok(vec![123456789, 18, 22, -42]);
-    println!("result2: {:?}", result2);
-    println!(
-        "mapped2: {:?}",
-        result2.map(|vs| vs.iter().fold(0, |a, b| a * 1 + b))
-    );
+        let result = uns_list.parse_str_raw(xs);
+        println!(
+            "unsignedlist \"{}\", result {:?}, rest: \"{}\"",
+            xs,
+            result.1,
+            &xs[result.0..]
+        );
+    }
 }
 
 #[test]
@@ -760,11 +899,45 @@ pub fn test() {
             ex
         );
     }
-    let text = "Dieser Satz besteht aus sechs Wörtern.";
-    print!("text \"{}\"   ", text);
-    match take(|c| c.is_alphabetic()).many(spaces()).parse_str(text) {
-        Ok(v) => println!("{:?}", v),
-        Err(e) => println!("{}", e),
+    for text in [
+        "Dieser Satz besteht aus sechs Wörtern.",
+        "Dieser Satz besteht aus 6 Wörtern.",
+        "?Blödsinn",
+        "Der böse Mann",
+        "dieser Tage",
+        "dieserTage",
+    ] {
+        print!("text \"{}\"   ", text);
+        match take(|c| c.is_alphabetic())
+            .many_sep_by(spaces())
+            .parse_str(text)
+        {
+            Ok(v) => println!("{:?}", v),
+            Err(e) => println!("{}", e),
+        }
+        match take(|c| c.is_alphabetic())
+            .label("word expected")
+            .guard(|v| v == "Der")
+            .map_err(|e| {
+                if e == String::default() {
+                    "'Der' expected".to_string()
+                } else {
+                    e
+                }
+            })
+            .parse_str(text)
+        {
+            Ok(v) => println!("{:?}", v),
+            Err(e) => println!("{}", e),
+        }
+        match take(|c| c.is_alphabetic())
+            .label("expected a word")
+            .when("dieser")
+            .parse_str(text)
+        {
+            Ok(v) => println!("{:?}", v),
+            Err(e) => println!("{}", e),
+        }
     }
 }
 
