@@ -17,8 +17,8 @@ pub const BLUE: &str = "\x1b\x5b34m";
 pub const NORMAL: &str = "\x1b\x5b0m";
 
 pub fn main() {
-    let hist_file = (env::var("HOME").and_then(|home| Ok(format!("{}/.comb_history", home))))
-        .or::<env::VarError>(Ok(".comb_history".to_string()))
+    let hist_file = (env::var("HOME").map(|home| format!("{}/.comb_history", home)))
+        .or_else::<env::VarError, _>(|_| Ok(".comb_history".to_string()))
         .unwrap();
     let config = Config::builder().auto_add_history(true).build();
     // `()` can be used when no completer is required
@@ -88,7 +88,7 @@ impl Hinter for SkiHelper {
     fn hint(&self, line: &str, _pos: usize, _ctx: &rustyline::Context<'_>) -> Option<Self::Hint> {
         match p_command()
             .before(spaces().then(end_of_input()))
-            .parse_str(&line)
+            .parse_str(line)
         {
             Ok(Eval(ski)) => Some(format!(
                 "{} → {}{}",
@@ -123,12 +123,12 @@ impl Highlighter for SkiHelper {
     fn highlight<'l>(&self, line: &'l str, _pos: usize) -> std::borrow::Cow<'l, str> {
         match p_command()
             .before(spaces().then(end_of_input()))
-            .parse_str_raw(&line)
+            .parse_str_raw(line)
         {
             (u, Err(_)) if u < line.len() && line.is_char_boundary(u) => {
                 let (a, b) = line.split_at(u);
                 let c = a.to_string() + RED + b + NORMAL;
-                std::borrow::Cow::from(c.clone())
+                std::borrow::Cow::from(c)
             }
             _other => std::borrow::Cow::Borrowed(line),
         }
@@ -136,7 +136,7 @@ impl Highlighter for SkiHelper {
     fn highlight_char(&self, line: &str, _pos: usize) -> bool {
         match p_command()
             .before(spaces().then(end_of_input()))
-            .parse_str_raw(&line)
+            .parse_str_raw(line)
         {
             (u, Err(_)) => u < line.len() && line.is_char_boundary(u),
             _other => false,

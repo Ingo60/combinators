@@ -253,8 +253,9 @@ where
     pub fn label(&self, lbl: &str) -> GenericP<S, R, String> {
         let p = self.clone();
         let msg = lbl.to_string(); // format!("{}", lbl);
-        GenericP::new(move |array| match (p.run)(array) {
-            (u, e) => (u, e.map_err(|_| msg.clone())),
+        GenericP::new(move |array| {
+            let (u, e) = (p.run)(array);
+            (u, e.map_err(|_| msg.clone()))
         })
     }
     /// The monadic bind operation, in Rust generally known as `and_then`
@@ -485,7 +486,7 @@ where
             let mut vs = Vec::new();
             let mut n = 0usize;
             loop {
-                let pq = if vs.len() == 0 { &p } else { &q };
+                let pq = if vs.is_empty() { &p } else { &q };
                 match (pq.run)(&array[n..]) {
                     (u, Ok(v)) => {
                         n += u;
@@ -513,18 +514,11 @@ where
                 (u, Ok(first)) => {
                     vs.push(first);
                     n += u;
-                    loop {
-                        match (q.run)(&array[n..]) {
-                            (u, Ok(other)) => {
-                                vs.push(other);
-                                n += u;
-                            }
-                            _ => {
-                                // n += u;
-                                break;
-                            }
-                        }
+                    while let (u, Ok(other)) = (q.run)(&array[n..]) {
+                        vs.push(other);
+                        n += u;
                     }
+
                     (n, Ok(vs))
                 }
                 (u, Err(e)) => (u, Err(e)),
@@ -640,7 +634,7 @@ where
     S: 'static,
 {
     GenericP::new(|array: &[S]| {
-        if array.len() == 0 {
+        if array.is_empty() {
             (0, Ok(()))
         } else {
             (0, Err("input not exhausted".to_string()))
@@ -652,7 +646,7 @@ where
 pub fn expect(c: char) -> GenericP<u8, char, String> {
     if c.is_ascii() {
         GenericP::new(move |array| {
-            if array.len() > 0 && array[0] == c as u8 {
+            if !array.is_empty() && array[0] == c as u8 {
                 (1, Ok(c))
             } else {
                 (0, Err(format!("'{}' expected", c)))
@@ -663,12 +657,12 @@ pub fn expect(c: char) -> GenericP<u8, char, String> {
             let n_bytes = c.len_utf8();
             let mut buffer = [0u8; 8];
             let encoded = c.encode_utf8(&mut buffer);
-            if array.len() > 0 && array.starts_with(encoded.as_bytes()) {
+            if !array.is_empty() && array.starts_with(encoded.as_bytes()) {
                 (n_bytes, Ok(c))
             } else {
                 (
                     0,
-                    Err(format!("'{}' ({:?}) expected", c, encoded.as_bytes())),
+                    Err(format!("'{}' ({:?}) expected", c, encoded.escape_unicode())),
                 )
             }
         })

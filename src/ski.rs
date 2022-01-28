@@ -83,18 +83,19 @@ impl SKI {
     /// returns true if the vector was changed
     fn evalstep(vs: &mut Vec<SKI>, hash: &HashMap<String, SKI>) -> bool {
         let some = vs.pop().unwrap();
+        let n_args = vs.len();
         match some {
-            S if vs.len() < 3 => {
+            S if n_args < 3 => {
                 vs.push(S);
-                return false;
+                false
             }
-            K if vs.len() < 2 => {
+            K if n_args < 2 => {
                 vs.push(K);
-                return false;
+                false
             }
-            I if vs.len() < 1 => {
+            I if n_args < 1 => {
                 vs.push(I);
-                return false;
+                false
             }
             S => {
                 // Sfgx = fx(gx)
@@ -104,33 +105,39 @@ impl SKI {
                 vs.push(g.app(x.clone()));
                 vs.push(x);
                 vs.push(f);
+                true
             }
             K => {
                 // Kab = a
                 let a = vs.pop().unwrap();
                 let _b = vs.pop();
                 vs.push(a);
+                true
             }
             I => {
                 // Ix = x  (but x is still on the stack, so we don't do anything)
+                true
             }
             app @ App(_, _) => {
                 // I(ab)xy → (ab)xy → abxy
                 app.unfolded(vs);
+                true
             }
             Comb(name) => match hash.get(&name) {
-                Some(s) => s.unfolded(vs),
+                Some(s) => {
+                    s.unfolded(vs);
+                    true
+                }
                 None => {
                     vs.push(Comb(name));
-                    return false;
+                    false
                 }
             },
             unknown => {
                 vs.push(unknown);
-                return false;
+                false
             }
         }
-        return true;
     }
 
     pub fn eval(&self, hash: &HashMap<String, SKI>) -> Self {
@@ -149,7 +156,7 @@ impl SKI {
     }
 
     pub fn folded(vs: &mut Vec<SKI>) -> Self {
-        assert!(vs.len() > 0);
+        assert!(!vs.is_empty());
         let mut some_a = vs.pop();
         while let Some(b) = vs.pop() {
             some_a = some_a.map(|a| a.app(b));
@@ -235,8 +242,8 @@ pub fn atom() -> GenericP<u8, SKI, String> {
                         .label("forbidden constructor name"),
                 )
                 .before(expect(']'))
-                .map(|s| Comb(s)))
-            .or(satisfy(|c| c.is_lowercase()).map(|c| Var(c)))
+                .map(Comb))
+            .or(satisfy(|c| c.is_lowercase()).map(Var))
             .label("variable or combinator expected"),
     )
 }

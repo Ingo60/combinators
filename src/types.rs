@@ -103,10 +103,7 @@ impl<T1, T2, E> Rebind<T1, T2> for Result<T1, E> {
 
 impl<T> Functor<T> for Option<T> {
     fn fmap<R>(self, f: impl Fn(T) -> R) -> <Self as Rebind<T, R>>::Rebound {
-        match self {
-            Some(a) => Some(f(a)),
-            None => None,
-        }
+        self.map(f)
     }
 }
 
