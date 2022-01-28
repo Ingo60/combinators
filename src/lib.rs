@@ -1,3 +1,4 @@
+pub mod interpreter;
 pub mod interruption;
 pub mod parser;
 pub mod ski;

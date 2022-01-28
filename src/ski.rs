@@ -1,6 +1,8 @@
-use super::interruption;
+use std::collections::HashMap;
 
+use super::interruption;
 use super::parser::*;
+
 use std::fmt;
 use std::rc::Rc;
 
@@ -16,7 +18,7 @@ pub enum SKI {
     App(Rc<SKI>, Rc<SKI>),
 }
 
-use SKI::*;
+pub use SKI::*;
 
 impl fmt::Display for SKI {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -68,18 +70,18 @@ impl SKI {
         }
     }
     /// Do at most n evaluation steps
-    pub fn step(&self, n_max: usize) -> Self {
+    pub fn step(&self, n_max: usize, hash: &HashMap<String, SKI>) -> Self {
         let mut vs = Vec::new();
         self.unfolded(&mut vs);
         let mut n = 0;
-        while n < n_max && SKI::evalstep(&mut vs) {
+        while n < n_max && SKI::evalstep(&mut vs, hash) {
             n += 1;
         }
         SKI::folded(&mut vs)
     }
 
     /// returns true if the vector was changed
-    fn evalstep(vs: &mut Vec<SKI>) -> bool {
+    fn evalstep(vs: &mut Vec<SKI>, hash: &HashMap<String, SKI>) -> bool {
         let some = vs.pop().unwrap();
         match some {
             S if vs.len() < 3 => {
@@ -116,6 +118,13 @@ impl SKI {
                 // I(ab)xy → (ab)xy → abxy
                 app.unfolded(vs);
             }
+            Comb(name) => match hash.get(&name) {
+                Some(s) => s.unfolded(vs),
+                None => {
+                    vs.push(Comb(name));
+                    return false;
+                }
+            },
             unknown => {
                 vs.push(unknown);
                 return false;
@@ -124,12 +133,12 @@ impl SKI {
         return true;
     }
 
-    pub fn eval(&self) -> Self {
+    pub fn eval(&self, hash: &HashMap<String, SKI>) -> Self {
         let mut vs = Vec::new();
         self.unfolded(&mut vs);
         let mut n_iter = 0;
         interruption::reset();
-        while SKI::evalstep(&mut vs) {
+        while SKI::evalstep(&mut vs, hash) {
             n_iter += 1;
             if n_iter % (1024 * 1024) == 0 && interruption::was_interrupted() {
                 eprintln!("\x08\x08aborted");
@@ -159,10 +168,58 @@ impl SKI {
             it => vs.push(it),
         }
     }
+
+    /// substitute default placeholder with given SKI
+    pub fn subst_default(&self, s: SKI) -> Self {
+        match self.clone() {
+            Comb(name) if name == "_" => s,
+            App(a, b) => a.subst_default(s.clone()).app(b.subst_default(s)),
+            ski => ski,
+        }
+    }
+
+    /// checks if expression contains variable 'v'
+    pub fn has(&self, v: char) -> bool {
+        match self {
+            S | K | I | Comb(_) => false,
+            Var(x) => v.eq(x),
+            App(a, b) => a.has(v) || b.has(v),
+        }
+    }
+
+    /// `x.eliminate(v)` computes an expression `y` that does not contain `v` such that `yv` evaluates to `x`
+    ///
+    /// # Elimination rules
+    ///
+    /// 1. `v.eliminate(v) = I` because `Iv = v`
+    /// 2. `x.eliminate(v) = Kx` if x does not contain v, because `Kxv = x`
+    /// 3. `(xv).eliminate(v) = x` if x does not contain v, because `xv = xv`
+    /// 4. `(ab).eliminate(v) = Scd` where `c = a.eliminate(v)` and `d=b.eliminate(v)`. Because `Scdv = cv(dv)` and `cv = a`
+    /// (by definition) and `dv = b` (by definition), `cv(dv) = ab`
+    pub fn eliminate(&self, v: char) -> Self {
+        match self.clone() {
+            Var(x) => {
+                if v == x {
+                    I /* by rule 1 */
+                } else {
+                    K.app(Var(x)) /* by rule 2 */
+                }
+            }
+            App(a, b) => match b.as_ref().clone() {
+                Var(x) if v == x && !a.has(v) => a.as_ref().clone(), /* by rule 3 */
+                _b if !self.has(v) => K.app(self.clone()),           /* by rule 2 */
+                b => S.app(a.eliminate(v)).app(b.eliminate(v)),      /* by rule 4 */
+            },
+            // self is not a variable and not of the form xy
+            // This means that v cannot occur in it, hence rule 2
+            other => K.app(other),
+        }
+    }
 }
 
+/// tell if this character can be the name of a combinator
 pub fn is_comb(c: char) -> bool {
-    c.is_uppercase() || c.is_numeric()
+    c.is_uppercase() || c.is_numeric() || c == '_'
 }
 
 pub fn atom() -> GenericP<u8, SKI, String> {
@@ -172,7 +229,11 @@ pub fn atom() -> GenericP<u8, SKI, String> {
             .or(expect('I').map(|_| I))
             .or(satisfy(is_comb).map(|c| Comb(c.to_string())))
             .or(expect('[')
-                .then(take(|c| c != ']'))
+                .then(
+                    take(|c| c != ']')
+                        .guard(|name| name != "S" && name != "K" && name != "V")
+                        .label("forbidden constructor name"),
+                )
                 .before(expect(']'))
                 .map(|s| Comb(s)))
             .or(satisfy(|c| c.is_lowercase()).map(|c| Var(c)))
@@ -183,6 +244,7 @@ pub fn atom() -> GenericP<u8, SKI, String> {
 pub fn term() -> GenericP<u8, SKI, String> {
     spaces().then(
         atom().or(expect('(')
+            .label("SKI term expected")
             .and_then(|_| expr())
             .before(spaces().then(expect(')')))),
     )
