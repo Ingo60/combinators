@@ -222,6 +222,24 @@ impl SKI {
             other => K.app(other),
         }
     }
+
+    /// checks if SKI expression is just a variable
+    pub fn is_var(&self) -> bool {
+        if let Var(_) = self {
+            true
+        } else {
+            false
+        }
+    }
+
+    /// checks if SKI consists only of vars applied to each other
+    pub fn is_varapp(&self) -> bool {
+        match self {
+            Var(_) => true,
+            App(a, b) => b.is_var() && a.is_varapp(),
+            _ => false,
+        }
+    }
 }
 
 /// tell if this character can be the name of a combinator
@@ -229,36 +247,57 @@ pub fn is_comb(c: char) -> bool {
     c.is_uppercase() || c.is_numeric() || c == '_'
 }
 
-pub fn atom() -> GenericP<u8, SKI, String> {
+pub fn p_comb() -> GenericP<u8, SKI, String> {
+    let single = satisfy(is_comb).map(|c| Comb(c.to_string()));
+    let brackets = expect('[')
+        .commit()
+        // .map_err(|_| "enter combinator name".to_string())
+        .then(
+            take(|c| c != ']')
+                .guard(|name| name != "S" && name != "K" && name != "I")
+                .map_err(|_| "type the constructor name".to_string()),
+        )
+        .before(expect(']'))
+        .map(Comb);
+    brackets.or(single.label("combinator expected"))
+}
+
+#[test]
+pub fn test_p_comb() {
+    for text in ["", "[", "[x", "[x]"] {
+        print!("text={:<8}", format!("\"{text}\""));
+        println!("p_comb {:?}", p_comb().parse_str_raw(text));
+        print!("text={:<8}", format!("\"{text}\""));
+        println!("p_atom {:?}", p_atom().parse_str_raw(text));
+        print!("text={:<8}", format!("\"{text}\""));
+        println!("p_term {:?}", p_term().parse_str_raw(text));
+    }
+}
+
+pub fn p_atom() -> GenericP<u8, SKI, String> {
     spaces().then(
         (expect('S').map(|_| S))
             .or(expect('K').map(|_| K))
             .or(expect('I').map(|_| I))
-            .or(satisfy(is_comb).map(|c| Comb(c.to_string())))
-            .or(expect('[')
-                .then(
-                    take(|c| c != ']')
-                        .guard(|name| name != "S" && name != "K" && name != "V")
-                        .label("forbidden constructor name"),
-                )
-                .before(expect(']'))
-                .map(Comb))
-            .or(satisfy(|c| c.is_lowercase()).map(Var))
-            .label("variable or combinator expected"),
+            .or(p_comb())
+            .or(satisfy(|c| c.is_lowercase())
+                .map(Var)
+                .label("variable or combinator expected")),
     )
 }
 
-pub fn term() -> GenericP<u8, SKI, String> {
-    spaces().then(
-        atom().or(expect('(')
-            .label("SKI term expected")
-            .and_then(|_| expr())
-            .before(spaces().then(expect(')')))),
-    )
+pub fn p_term() -> GenericP<u8, SKI, String> {
+    (spaces()
+        .then(expect('('))
+        .label("SKI term expected")
+        .commit()
+        .and_then(|_| p_expr())
+        .before(spaces().then(expect(')'))))
+    .or(p_atom())
 }
 
-pub fn expr() -> GenericP<u8, SKI, String> {
-    term()
+pub fn p_expr() -> GenericP<u8, SKI, String> {
+    p_term()
         .some()
         .map(|vs| vs.iter().cloned().reduce(|a, b| a.app(b)).unwrap())
     // .label("SKI term expected")
@@ -278,7 +317,10 @@ pub fn parse_test() {
         "(This) (is) (nice)",
     ] {
         print!("text \"{}\"   ", text);
-        match expr().before(spaces().then(end_of_input())).parse_str(text) {
+        match p_expr()
+            .before(spaces().then(end_of_input()))
+            .parse_str(text)
+        {
             Ok(v) => println!("{}", v),
             Err(e) => println!("{}", e),
         }
