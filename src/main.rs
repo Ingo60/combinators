@@ -12,9 +12,15 @@ use rustyline::{Config, Editor, Helper};
 use std::{env, ops::DerefMut};
 
 pub const RED: &str = "\x1b\x5b31m";
-pub const YELLOW: &str = "\x1b\x5b32m";
 pub const BLUE: &str = "\x1b\x5b34m";
+pub const YELLOW: &str = "\x1b\x5b32m";
 pub const NORMAL: &str = "\x1b\x5b0m";
+
+/// move cursor to start of previous line
+pub const CPL: &str = "\x1b\x5b1A\r";
+
+/// erase entire line without cursor movement
+pub const EL2: &str = "\x1b\x5b2K";
 
 pub fn main() {
     let hist_file = (env::var("HOME").map(|home| format!("{}/.comb_history", home)))
@@ -32,15 +38,16 @@ pub fn main() {
         println!("No previous history in {}", hist_file);
     }
     interruption::initialize();
+    println!("Welcome to this SKI-Interpreter. Type \":help\" for help.");
     loop {
         rl.set_helper(Some(ski_helper.clone()));
         let readline = rl.readline("⌦ ");
         match readline {
-            Ok(line) => match p_command()
-                .before(spaces().then(end_of_input()))
-                .parse_str(&line)
-            {
+            Ok(line) => match p_command().parse_str(&line) {
                 Ok(cmd) => {
+                    if spaces().then(end_of_input()).parse_str(&line).is_ok() {
+                        print!("{}{}", CPL, EL2);
+                    }
                     inter.deref_mut().execute(cmd);
                     ski_helper.update_inter(inter.clone());
                 }
@@ -86,10 +93,7 @@ impl Hinter for SkiHelper {
     type Hint = String;
 
     fn hint(&self, line: &str, _pos: usize, _ctx: &rustyline::Context<'_>) -> Option<Self::Hint> {
-        match p_command()
-            .before(spaces().then(end_of_input()))
-            .parse_str(line)
-        {
+        match p_command().parse_str(line) {
             Ok(Eval(ski)) => Some(format!(
                 "{} → {}{}",
                 BLUE,
@@ -114,6 +118,7 @@ impl Hinter for SkiHelper {
                     .un_i(),
                 NORMAL
             )),
+            Ok(ListAll) | Ok(List(_)) | Ok(Help) | Ok(Load(_)) | Ok(Echo(_)) => None,
             Err(s) => Some(format!("     {}{}{}", RED, s, NORMAL)),
         }
     }
@@ -125,7 +130,7 @@ impl Highlighter for SkiHelper {
             .before(spaces().then(end_of_input()))
             .parse_str_raw(line)
         {
-            (u, Err(_)) if u < line.len() && line.is_char_boundary(u) => {
+            (u, _, Err(_)) if u < line.len() && line.is_char_boundary(u) => {
                 let (a, b) = line.split_at(u);
                 let c = a.to_string() + RED + b + NORMAL;
                 std::borrow::Cow::from(c)
@@ -138,7 +143,7 @@ impl Highlighter for SkiHelper {
             .before(spaces().then(end_of_input()))
             .parse_str_raw(line)
         {
-            (u, Err(_)) => u < line.len() && line.is_char_boundary(u),
+            (u, _, Err(_)) => u < line.len() && line.is_char_boundary(u),
             _other => false,
         }
     }

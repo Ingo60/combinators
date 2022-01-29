@@ -21,9 +21,9 @@ pub trait Parser<S, R, E> {
     /// ```
     /// expect('e').then(expect('z')).parse_raw("èz".as_bytes())
     /// ```
-    fn parse_raw(&self, src: &[S]) -> (usize, Result<R, E>);
+    fn parse_raw(&self, src: &[S]) -> ParseResult<R, E>;
     fn parse(&self, src: &[S]) -> Result<R, E> {
-        let (_, it) = self.parse_raw(src);
+        let (_, _, it) = self.parse_raw(src);
         it
     }
 }
@@ -158,7 +158,7 @@ pub const YELLOW: &str = "\x1b\x5b32m";
 pub const NORMAL: &str = "\x1b\x5b0m";
 
 pub trait StrParser<R, E>: Parser<u8, R, E> {
-    fn parse_str_raw(&self, src: &str) -> (usize, Result<R, E>) {
+    fn parse_str_raw(&self, src: &str) -> ParseResult<R, E> {
         self.parse_raw(src.as_bytes())
     }
     fn parse_str(&self, src: &str) -> Result<R, String>
@@ -166,8 +166,8 @@ pub trait StrParser<R, E>: Parser<u8, R, E> {
         E: Display,
     {
         match self.parse_str_raw(src) {
-            (_, Ok(v)) => Ok(v),
-            (u, Err(e)) => {
+            (_, _, Ok(v)) => Ok(v),
+            (u, _, Err(e)) => {
                 // eprintln!("{}bytes {:?}{}", YELLOW, src.as_bytes(), NORMAL);
                 let mut v = u;
                 for c in src[u..].chars() {
@@ -198,8 +198,8 @@ pub trait StrParser<R, E>: Parser<u8, R, E> {
     }
 }
 
-type ParseResult<R, E> = (usize, Result<R, E>);
-type ParserFunc<S, R, E> = Rc<dyn Fn(&[S]) -> (usize, Result<R, E>)>;
+type ParseResult<R, E> = (usize, bool, Result<R, E>);
+type ParserFunc<S, R, E> = Rc<dyn Fn(&[S]) -> ParseResult<R, E>>;
 
 pub struct GenericP<S, R, E> {
     run: ParserFunc<S, R, E>,
@@ -215,6 +215,41 @@ where
         GenericP {
             run: Rc::clone(&self.run),
         }
+    }
+}
+
+impl<S, R> GenericP<S, R, String>
+where
+    S: 'static,
+    R: 'static,
+{
+    /// `p.label("message")` causes the error message to be `"message"` when `p` fails.
+    /// It is basically
+    ///
+    ///     p.or(fail("message"))
+    ///
+    /// The error will be reported at the position where `p` was attempted,
+    /// not necessarily at the position where `p` failed.
+    ///
+    ///
+    ///     expect('a').then(expect('b')).parse_str("a?")
+    ///     line 1:2 expected 'b', found "?"
+    ///
+    /// but
+    ///
+    ///     expect('a').then(expect('b')).label("no ab today").parse_str("a?")
+    ///     line 1:1 no ab today, found "a?"
+    ///
+    /// If you need the reporting at the point where `p` actually failed, use `map_err`
+    pub fn label(&self, lbl: &'static str) -> GenericP<S, R, String> {
+        // self.or(fail(lbl))
+        let p = self.clone();
+
+        GenericP::new(move |array| {
+            let msg = lbl.to_string();
+            let (u, c, e) = (p.run)(array);
+            (if e.is_err() { 0 } else { u }, c, e.map_err(move |_| msg))
+        })
     }
 }
 
@@ -238,7 +273,51 @@ where
         GenericP { run: Rc::new(f) }
     }
 
+    /// Marks the result of subsequent  parsers as committed.
+    ///
+    /// All parsers that parse subsequent input, that is, parsers that are built from
+    /// this one with *and_then()*, *and()*, *then()* or *before()* will pass on the status.
+    /// This will make a difference when one of the descendants is connected
+    /// to another parser with *or()*, because *or()* will not try alternatives for committed results.
+    /// Instead, it will propagate the failure as the overall result just like a success would be propagated.
+    ///
+    /// Here is an example:
+    ///
+    ///     let word = take(|c| c.is_alphabetic()).label("word expected")
+    ///                 .map(|w| vec![w]);
+    ///     let words = expect('(').then(word.many_sep_by(spaces())).before(expect(')'))
+    ///     let p = word.or(words);
+    ///     let q = words.or(word);
+    ///
+    /// Now, during parsing, when the input is accepted, everything is fine (we get a list of words).
+    /// However, the problem is in the failure case.
+    ///
+    /// If the input is not acceptable, *p* will only tell us why it is not acceptable for the list case.
+    /// For example, when the input is "10", it will say "'(' expected".
+    ///
+    /// For *q* things are even worse. The only error we can get from *q* is "word expected" and the error position
+    /// will always be the position where **q** started off. For example, when the input is "(abc def", it will be
+    /// "word expected at position 1, found '('", despite the error originating in the missing closing ')'.
+    ///
+    /// We can't do much about `p`, but we can enhance `q` by committing *words* after we have seen the '('. For, there is
+    /// no possibility that *word* could match when the input starts with '('.
+    ///
+    ///     let words = expect('(').commit().then(word.many_sep_by(spaces())).before(expect(')'))
+    ///  
+    /// When, after having successfully parsed an initial part of the input, there is no possibility that other alternative
+    /// branches in an **or** construct could succeed, it is advisable to commit to this alternative. This will enhance
+    /// error reporting quality and avoid fruitless re-parsing of the same input.
+    ///
+    pub fn commit(&self) -> Self {
+        let p = self.clone();
+        GenericP::new(move |array: &[S]| {
+            let (u, _, r) = (p.run)(array);
+            (u, r.is_ok(), r)
+        })
+    }
+
     /// `p.label("message")` causes the error message to be `"message"` when `p` fails.
+    /// It is basically p.or(fail("message")) for uncommitted parsers.
     ///
     /// The error will be reported at the position where `p` was attempted,
     /// not necessarily at the position where `p` failed.
@@ -250,12 +329,17 @@ where
     /// > `expect('a').then(expect('b')).label("no ab today").parse_str("a?")`
     ///
     /// will be `1:1 no ab today, found "a?"`
-    pub fn label(&self, lbl: &str) -> GenericP<S, R, String> {
+    ///
+    /// If you need the reporting at the point where `p` actually failed, use `map_err`
+    pub fn label_generic(&self, lbl: E) -> GenericP<S, R, E>
+    where
+        E: Copy,
+    {
+        // self.or(GenericP::new(move |_| (0, Err(lbl))))
         let p = self.clone();
-        let msg = lbl.to_string(); // format!("{}", lbl);
         GenericP::new(move |array| {
-            let (u, e) = (p.run)(array);
-            (u, e.map_err(|_| msg.clone()))
+            let (u, c, e) = (p.run)(array);
+            (if e.is_err() { 0 } else { u }, c, e.map_err(|_| lbl))
         })
     }
     /// The monadic bind operation, in Rust generally known as `and_then`
@@ -302,11 +386,11 @@ where
     {
         let p = self.clone();
         GenericP::new(move |array| match (p.run)(array) {
-            (u, Ok(a)) => match (f(a).run)(&array[u..]) {
-                (v, Ok(b)) => (u + v, Ok(b)),
-                (v, Err(e)) => (u + v, Err(e)),
+            (u, c, Ok(a)) => match (f(a).run)(&array[u..]) {
+                (v, _, Ok(b)) => (u + v, c, Ok(b)),
+                (v, _, Err(e)) => (u + v, c, Err(e)),
             },
-            (u, Err(err)) => (u, Err(err)),
+            (u, c, Err(err)) => (u, c, Err(err)),
         })
     }
 
@@ -338,18 +422,18 @@ where
     pub fn and<T>(&self, r: impl Borrow<GenericP<S, T, E>>) -> GenericP<S, (R, T), E>
     where
         T: 'static,
-        R: Copy,
-        T: Copy,
+        // R: Copy,
+        // T: Copy,
     {
         let q = r.borrow().clone();
         // self.and_then(move |pv| q.and_then(move |qv| pure((pv, qv))))
         let p = self.clone();
         GenericP::new(move |array| match (p.run)(array) {
-            (u, Ok(a)) => match (q.run)(&array[u..]) {
-                (v, Ok(b)) => (u + v, Ok((a, b))),
-                (v, Err(e)) => (u + v, Err(e)),
+            (u, c, Ok(a)) => match (q.run)(&array[u..]) {
+                (v, _, Ok(b)) => (u + v, c, Ok((a, b))),
+                (v, _, Err(e)) => (u + v, c, Err(e)),
             },
-            (u, Err(err)) => (u, Err(err)),
+            (u, c, Err(err)) => (u, c, Err(err)),
         })
     }
 
@@ -365,31 +449,36 @@ where
     pub fn before<T>(&self, r: impl Borrow<GenericP<S, T, E>>) -> GenericP<S, R, E>
     where
         T: 'static,
-        E: 'static,
-        R: 'static,
+        // E: 'static,
+        // R: 'static,
     {
         // self.and_then(move |pv| q.and_then(move |_| pure(pv.clone())))
         let p = self.clone();
         let q = r.borrow().clone();
         GenericP::new(move |array| match (p.run)(array) {
-            (u, Ok(a)) => match (q.run)(&array[u..]) {
-                (v, Ok(_b)) => (u + v, Ok(a)),
-                (v, Err(e)) => (u + v, Err(e)),
+            (u, c, Ok(a)) => match (q.run)(&array[u..]) {
+                (v, _, Ok(_b)) => (u + v, c, Ok(a)),
+                (v, _, Err(e)) => (u + v, c, Err(e)),
             },
-            (u, Err(err)) => (u, Err(err)),
+            (u, c, Err(err)) => (u, c, Err(err)),
         })
     }
 
-    /// `p.or(q)`
+    ///     p.or(q)
     ///  
     /// When `p` suceeds, this is the overall result.
+    /// The same is the case when `p` fails and the result is committed.
+    ///
     /// Otherwise, `q` is tried on the same input as `p` regardless whether `p` already consumed something.
+    ///
+    /// Only the failure of the left hand side of the **or** will propagate the committed state.
     ///
     pub fn or(&self, r: impl Borrow<GenericP<S, R, E>>) -> GenericP<S, R, E> {
         let p = self.clone();
         let q = r.borrow().clone();
         GenericP::new(move |array| match (p.run)(array) {
-            r @ (_, Ok(_)) => r,
+            (ur, _uc, ok @ Ok(_)) => (ur, false, ok),
+            (ur, true, rp) => (ur, true, rp),
             _other => (q.run)(array),
         })
     }
@@ -401,8 +490,8 @@ where
     {
         let p = self.clone();
         GenericP::new(move |array| match (p.run)(array) {
-            (u, Ok(v)) => (u, Ok(f(v))),
-            (u, Err(e)) => (u, Err(e)),
+            (u, c, Ok(v)) => (u, c, Ok(f(v))),
+            (u, c, Err(e)) => (u, c, Err(e)),
         })
     }
 
@@ -420,8 +509,8 @@ where
     {
         let p = self.clone();
         GenericP::new(move |array| match (p.run)(array) {
-            (u, Ok(v)) => (u, f(v)),
-            (u, Err(e)) => (u, Err(e)),
+            (u, c, Ok(v)) => (u, c, f(v)),
+            (u, c, Err(e)) => (u, c, Err(e)),
         })
     }
 
@@ -439,23 +528,23 @@ where
     {
         let p = self.clone();
         GenericP::new(move |array| match (p.run)(array) {
-            (u, Ok(v)) => match f(v) {
-                Some(r) => (u, Ok(r)),
-                None => (u, Err(E::default())),
+            (u, c, Ok(v)) => match f(v) {
+                Some(r) => (u, c, Ok(r)),
+                None => (u, c, Err(E::default())),
             },
-            (u, Err(e)) => (u, Err(e)),
+            (u, c, Err(e)) => (u, c, Err(e)),
         })
     }
 
-    /// `p.map_err(f)` maps the error value when `p` fails. This is a more powerful variant of `p.label(str)`.
+    /// `p.map_err(f)` maps the error value when `p` fails.
     pub fn map_err<F>(&self, f: impl Fn(E) -> F + 'static) -> GenericP<S, R, F>
     where
         F: 'static,
     {
         let p = self.clone();
         GenericP::new(move |array| match (p.run)(array) {
-            (u, Ok(v)) => (u, Ok(v)),
-            (u, Err(e)) => (u, Err(f(e))),
+            (u, c, Ok(v)) => (u, c, Ok(v)),
+            (u, c, Err(e)) => (u, c, Err(f(e))),
         })
     }
 
@@ -464,8 +553,8 @@ where
     pub fn optional(&self) -> GenericP<S, Option<R>, E> {
         let p = self.clone();
         GenericP::new(move |array| match (p.run)(array) {
-            (u, Ok(v)) => (u, Ok(Some(v))),
-            (u, Err(_)) => (u, Ok(None)),
+            (u, c, Ok(v)) => (u, c, Ok(Some(v))),
+            (_, c, Err(_)) => (0, c, Ok(None)),
         })
     }
 
@@ -488,11 +577,11 @@ where
             loop {
                 let pq = if vs.is_empty() { &p } else { &q };
                 match (pq.run)(&array[n..]) {
-                    (u, Ok(v)) => {
+                    (u, _c, Ok(v)) => {
                         n += u;
                         vs.push(v);
                     }
-                    (u, Err(_)) => return (n + u, Ok(vs)),
+                    (_, _, Err(_)) => return (n, false, Ok(vs)),
                 }
             }
         })
@@ -511,17 +600,16 @@ where
             let mut n = 0usize;
 
             match (p.run)(array) {
-                (u, Ok(first)) => {
+                (u, c, Ok(first)) => {
                     vs.push(first);
                     n += u;
-                    while let (u, Ok(other)) = (q.run)(&array[n..]) {
+                    while let (u, _, Ok(other)) = (q.run)(&array[n..]) {
                         vs.push(other);
                         n += u;
                     }
-
-                    (n, Ok(vs))
+                    (n, c, Ok(vs))
                 }
-                (u, Err(e)) => (u, Err(e)),
+                (u, c, Err(e)) => (u, c, Err(e)),
             }
         })
     }
@@ -543,7 +631,7 @@ where
     /// Returns the value of `p` when `p` succeeds and the guard condition evaluates to **true**
     ///
     /// Restrictions: the error type of `p` must implement `Default`. This default error value is
-    /// returned when the giard fails. It is thus advised to `map_err` the error information or to `label` it.
+    /// returned when the guard fails. It is thus advised to `map_err` the error information or to `label` it.
     ///
     /// In addition, the return value of `p` must implement `Clone`.
     pub fn guard(&self, f: impl Fn(R) -> bool + 'static) -> GenericP<S, R, E>
@@ -553,11 +641,11 @@ where
     {
         let p = self.clone();
         GenericP::new(move |array| match (p.run)(array) {
-            (u, Ok(ok)) => {
+            (u, c, Ok(ok)) => {
                 if f(ok.clone()) {
-                    (u, Ok(ok))
+                    (u, c, Ok(ok))
                 } else {
-                    (u, Err(E::default()))
+                    (u, c, Err(E::default()))
                 }
             }
             e => e,
@@ -572,20 +660,67 @@ where
     {
         let p = self.clone();
         GenericP::new(move |array| match (p.run)(array) {
-            (u, Ok(v)) => {
+            (u, c, Ok(v)) => {
                 if v.borrow() == expected {
-                    (u, Ok(v.borrow().clone()))
+                    (u, c, Ok(v.borrow().clone()))
                 } else {
-                    (u, Err(format!("{:?} expected", expected)))
+                    (u, c, Err(format!("{:?} expected", expected)))
                 }
             }
-            (u, Err(e)) => (u, Err(format!("{}", e))),
+            (u, c, Err(e)) => (u, c, Err(format!("{}", e))),
         })
     }
+
+    /*
+    /// `p.and_cond(|v| -> q,r)` like `p.cond(q,r)` but `q` will be constructed using the result of `p`
+    pub fn and_cond<T>(
+        &self,
+        f: impl Fn(R) -> GenericP<S, T, E> + 'static,
+        r: impl Borrow<GenericP<S, T, E>>,
+    ) -> GenericP<S, T, E>
+    where
+        T: 'static,
+    {
+        let p = self.clone();
+        let r = r.borrow().clone();
+        GenericP::new(move |array| match (p.run)(array) {
+            (u, Ok(a)) => {
+                let (v, qr) = (f(a).run)(&array[u..]);
+                (u + v, qr)
+            }
+            _ => (r.run)(array),
+        })
+    }
+
+    /// `p.cond(q,r)`
+    /// is similar to `p.then(q).or(r)` but differs in the error handling.
+    /// It is useful for cases when - once `p` succeeds - `r` can never match.
+    ///
+    /// With the `or` construct one gets the error from `r` no matter what happened before.
+    /// With `cond` construct, if `p` succeeds, but `q` failed, one gets the error from `q` and `r` isn't even tried.
+    pub fn cond<T>(
+        &self,
+        q: impl Borrow<GenericP<S, T, E>>,
+        r: impl Borrow<GenericP<S, T, E>>,
+    ) -> GenericP<S, T, E>
+    where
+        T: 'static,
+    {
+        let p = self.clone();
+        let q = q.borrow().clone();
+        let r = r.borrow().clone();
+        GenericP::new(move |array| match (p.run)(array) {
+            (u, Ok(_)) => {
+                let (v, qr) = (q.run)(&array[u..]);
+                (u + v, qr)
+            }
+            _ => (r.run)(array),
+        })
+    } */
 }
 
 impl<S, R, E> Parser<S, R, E> for GenericP<S, R, E> {
-    fn parse_raw(&self, src: &[S]) -> (usize, Result<R, E>) {
+    fn parse_raw(&self, src: &[S]) -> ParseResult<R, E> {
         (self.run)(src)
     }
 }
@@ -596,13 +731,20 @@ impl<R, E> StrParser<R, E> for GenericP<u8, R, E> {}
 
 /// A parser that always succeeds and returns the supplied value.
 /// Useful as last element in nested `and_then` constructs.
+///
+/// Restriction: The type of the value must implement `Copy`.
+/// If `pure(v)` doesn't compile, try
+/// ```
+/// pure(()).map(|_| v)
+/// ```
+/// instead.
 pub fn pure<S, R, E>(v: R) -> GenericP<S, R, E>
 where
     S: 'static,
     R: Copy + 'static,
     E: 'static,
 {
-    GenericP::new(move |_| (0, Ok(v)))
+    GenericP::new(move |_| (0, false, Ok(v)))
 }
 
 /// A parser that always fails without consuming anything. The error contains the supplied (String) value.
@@ -611,7 +753,7 @@ where
     S: 'static,
     R: 'static,
 {
-    GenericP::new(move |_| (0, Err(e.to_string())))
+    GenericP::new(move |_| (0, false, Err(e.to_string())))
 }
 ///
 /// A parser that succeeds if and only if the source slice is empty.
@@ -635,9 +777,9 @@ where
 {
     GenericP::new(|array: &[S]| {
         if array.is_empty() {
-            (0, Ok(()))
+            (0, false, Ok(()))
         } else {
-            (0, Err("input not exhausted".to_string()))
+            (0, false, Err("input not exhausted".to_string()))
         }
     })
 }
@@ -647,9 +789,9 @@ pub fn expect(c: char) -> GenericP<u8, char, String> {
     if c.is_ascii() {
         GenericP::new(move |array| {
             if !array.is_empty() && array[0] == c as u8 {
-                (1, Ok(c))
+                (1, false, Ok(c))
             } else {
-                (0, Err(format!("'{}' expected", c)))
+                (0, false, Err(format!("'{}' expected", c)))
             }
         })
     } else {
@@ -658,10 +800,11 @@ pub fn expect(c: char) -> GenericP<u8, char, String> {
             let mut buffer = [0u8; 8];
             let encoded = c.encode_utf8(&mut buffer);
             if !array.is_empty() && array.starts_with(encoded.as_bytes()) {
-                (n_bytes, Ok(c))
+                (n_bytes, false, Ok(c))
             } else {
                 (
                     0,
+                    false,
                     Err(format!("'{}' ({:?}) expected", c, encoded.escape_unicode())),
                 )
             }
@@ -674,11 +817,11 @@ pub fn expect(c: char) -> GenericP<u8, char, String> {
 /// Fails on end of input or when the character fails the predicate, in which case nothing is consumed.
 pub fn satisfy(f: impl Fn(char) -> bool + 'static) -> GenericP<u8, char, String> {
     GenericP::new(move |array| match from_utf8(array) {
-        Err(utf8) => (0, Err(format!("{}", utf8))),
+        Err(utf8) => (0, false, Err(format!("{}", utf8))),
         Ok(str) => match str.chars().next() {
-            None => (0, Err("unexpected end of input".to_string())),
-            Some(c) if f(c) => (c.len_utf8(), Ok(c)),
-            Some(_) => (0, Err("no match".to_string())),
+            None => (0, false, Err("unexpected end of input".to_string())),
+            Some(c) if f(c) => (c.len_utf8(), false, Ok(c)),
+            Some(_) => (0, false, Err("no match".to_string())),
         },
     })
 }
@@ -694,7 +837,7 @@ where
     GenericP::new(move |array| {
         let mut u = 0usize;
         match from_utf8(array) {
-            Err(_utf8) => (0, Ok(())),
+            Err(_utf8) => (0, false, Ok(())),
             Ok(str) => {
                 for ch in str.chars() {
                     if f(ch) {
@@ -703,7 +846,7 @@ where
                         break;
                     }
                 }
-                (u, Ok(()))
+                (u, false, Ok(()))
             }
         }
     })
@@ -717,7 +860,7 @@ pub fn take(f: impl Fn(char) -> bool + 'static) -> GenericP<u8, String, String> 
     GenericP::new(move |array| {
         let mut u = 0usize;
         match from_utf8(array) {
-            Err(utf8) => (0, Err(format!("{}", utf8))),
+            Err(utf8) => (0, false, Err(format!("{}", utf8))),
             Ok(str) => {
                 for ch in str.chars() {
                     if f(ch) {
@@ -727,9 +870,9 @@ pub fn take(f: impl Fn(char) -> bool + 'static) -> GenericP<u8, String, String> 
                     }
                 }
                 if u > 0 {
-                    (u, Ok(str[0..u].to_string()))
+                    (u, false, Ok(str[0..u].to_string()))
                 } else {
-                    (0, Err("no matches".to_string()))
+                    (0, false, Err("no matches".to_string()))
                 }
             }
         }
@@ -816,6 +959,43 @@ pub fn sum_of_digits() {
 }
 
 #[test]
+pub fn test_commit() {
+    let p1 = expect('a').then(expect('b'));
+    let p2 = expect('a').commit().then(spaces()).then(expect('b'));
+    let p3 = p1.or(fail("p1 failed")).or(fail("last alt failed"));
+    let p4 = p2.or(fail("p2 failed")).or(fail("MUST NOT HAPPEN"));
+    for text in ["ax", "xa"] {
+        for p in [p1.clone(), p2.clone(), p3.clone(), p4.clone()] {
+            println!("text \"{text}\"    {:?}", p.parse_str_raw(text));
+        }
+    }
+}
+#[test]
+pub fn test2() {
+    let comment = expect('-')
+        .then(expect('-'))
+        // .or(fail("hier"))
+        .then(skip(|_| true));
+    let end_of_line = spaces().then(comment.optional()).then(end_of_input());
+
+    for text in ["", "bla", "-bla", "-+bla", "--bla ", "-"] {
+        print!("text \"{}\"   ", text);
+        println!("{:?}", end_of_line.parse_str_raw(text));
+        let text = &format!("   {}", text)[..];
+        print!("text \"{}\"   ", text);
+        println!("{:?}", end_of_line.parse_str_raw(text));
+    }
+    println!("{:?}", expect('a').then(expect('b')).parse_str("a?"));
+    println!(
+        "{:?}",
+        expect('a')
+            .then(expect('b'))
+            .label("Quatsch!")
+            .parse_str("a?")
+    );
+}
+
+#[test]
 pub fn test() {
     let ä = expect('Ä');
     let r = ä.parse("Äbc".as_bytes());
@@ -857,7 +1037,7 @@ pub fn test() {
         ez2.as_bytes(),
         ez2
     );
-    let (bytes, err) = expect('e').and(expect('z')).parse_str_raw(ez2);
+    let (bytes, _committed, err) = expect('e').and(expect('z')).parse_str_raw(ez2);
     println!(
         "({}, {:?} remaining input {:?}",
         bytes,
