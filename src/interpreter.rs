@@ -7,7 +7,7 @@ pub const BLUE: &str = "\x1b\x5b34m";
 
 use super::parser::{end_of_input, expect, pure, spaces, take, GenericP, NORMAL, YELLOW};
 use super::ski;
-use super::ski::{p_comb, App, Comb, Var, I, K, S, SKI};
+use super::ski::{p_comb, App, Comb, Var, I, K, PC, PN, S, SKI};
 
 use std::{
     collections::{HashMap, HashSet},
@@ -18,6 +18,7 @@ use std::{
 #[derive(Clone)]
 pub struct Interpreter {
     pub last: SKI,
+    pub loaded: Option<String>,
     pub env: HashMap<String, SKI>,
 }
 
@@ -30,7 +31,11 @@ impl Default for Interpreter {
 impl Interpreter {
     pub fn new() -> Self {
         let hash = HashMap::new();
-        Interpreter { last: I, env: hash }
+        Interpreter {
+            last: I,
+            env: hash,
+            loaded: None,
+        }
     }
 
     pub fn execute(&mut self, cmd: Command) {
@@ -43,6 +48,8 @@ impl Interpreter {
                 println!("  :list C          list definition of combinator C");
                 println!("  :load filename   load definitions in the named file");
                 println!("  :echo text       print text on standard output");
+                println!("  :clear           forget all definitions");
+                println!("  :reload          forget all definitions and re-load source file");
                 println!("  expr             perform 1 reduction on expr");
                 println!("  expr?            evaluate expr until no more reductions are possible");
                 println!("  expr = expr      define a combinator");
@@ -50,7 +57,7 @@ impl Interpreter {
                 println!("                   name applied to a number of different variables.");
                 println!("                   The right hand side must not contain variables not");
                 println!("                   introduced on the left hand side.");
-                println!("");
+                println!();
                 println!("Syntax of expresions:");
                 println!("    Variable: single lowercase letter");
                 println!("    Combinator: single uppercase letter or digit or arbitrary characters enclosed in []");
@@ -59,11 +66,29 @@ impl Interpreter {
                 println!(
                     "  Note that `FGH` is the same as `(FG)H` and quite different from `F(GH)`"
                 );
+                println!("Predefined Combinators (cannot be redefined)");
+                println!("   Sfgx = fx(gx)");
+                println!("   Kxy  = x");
+                println!("   Ix   = x");
+                println!(
+                    "   #n   = I    -- n is a number and gets printed as side effect of evaluation"
+                );
+                println!("               -- combinators [pred] and [zero?] must be defined.");
+                println!("   .n   = I    -- n is a number and corresponding character is printed as side");
+                println!(
+                    "               -- effect, combinators [pred] and [zero?] must be defined."
+                );
                 println!("Conveniences:");
                 println!(
-                    "  The pseudo combinator _ can be used for the last evaluated expression."
+                    "  1. The pseudo combinator _ can be used for the last evaluated expression."
                 );
-                println!("  An empty line evaluates _ one step further.");
+                println!("  2. An empty line evaluates _ one step further.");
+                println!(
+                    "  3. [n] with n a number != 0 is replaced with n applications of [succ] to 0"
+                );
+                println!("     Both [succ] and 0 must be defined.");
+                println!("  4. 'c' is replaced with n applications of [succ] to 0, where n is the");
+                println!("     char value of c, such that .'c' prints c.");
             }
             Eval(ski) => {
                 let current = ski.subst_default(self.last.clone()).eval(&self.env).un_i();
@@ -114,6 +139,9 @@ impl Interpreter {
             }
             List(name) => match self.env.get(&name) {
                 Some(ski) => println!("{} = {}", Comb(name), ski),
+                None if name == "S" => println!("Sfgx = fx(gx)"),
+                None if name == "K" => println!("Kxy = x"),
+                None if name == "I" => println!("Ix = x"),
                 None => {
                     eprintln!("{}combinator not defined: {}{}", YELLOW, Comb(name), NORMAL)
                 }
@@ -126,19 +154,32 @@ impl Interpreter {
                     }
                     Ok(f) => {
                         for ok_line in BufReader::new(f).lines() {
-                            if let Ok(line) = ok_line {
-                                n_line += 1;
-                                match p_command().parse_str(&line) {
-                                    Ok(cmd) => self.execute(cmd),
-                                    Err(e) => eprintln!(
-                                        "line {}:{}{}{}\nerror: {}{}{}",
-                                        n_line, YELLOW, line, NORMAL, RED, e, NORMAL,
-                                    ),
-                                }
-                            }
+                            ok_line
+                                .map(|line| {
+                                    n_line += 1;
+                                    match p_command().parse_str(&line) {
+                                        Ok(Step(Comb(x))) if x == "_" => {}
+                                        Ok(cmd) => self.execute(cmd),
+                                        Err(e) => eprintln!(
+                                            "line {}:{}{}{}\nerror: {}{}{}",
+                                            n_line, YELLOW, line, NORMAL, RED, e, NORMAL,
+                                        ),
+                                    };
+                                })
+                                .unwrap_or_default();
                         }
+                        self.loaded = Some(path);
                     }
                 };
+            }
+            Clear => self.env.clear(),
+            Reload => {
+                if let Some(f) = self.loaded.clone() {
+                    self.execute(Clear);
+                    self.execute(Load(f))
+                } else {
+                    eprintln!("{}You didn't load anything before.{}", YELLOW, NORMAL);
+                }
             }
             Echo(text) => println!("{}{}{}", BLUE, text, NORMAL),
         };
@@ -153,8 +194,29 @@ fn def(
 ) -> Result<(String, SKI), String> {
     let name = check_lhs(left.clone(), vars, env)?;
     check_free_vars(right.clone(), vars)?;
-    let rhs = elim(left, right.un_i());
-    Ok((name, rhs.un_i()))
+    let rhs = elim(left, right.un_i()).un_i();
+
+    // We enforce:
+    // - no self recursion
+    // - no replacement of already used combinators
+    // - no usage of unknown combinators
+    if rhs.has_comb(&name) {
+        Err("recursion not permitted".to_string())
+    } else if rhs.has_comb("_") {
+        Err("pseudo combinator _ not permitted in definitions".to_string())
+    } else if let Some(kv) = env.iter().find(|(_k, v)| v.has_comb(&name)) {
+        Err(format!(
+            "cannot redefine {}, it is used in other combinators, for instance {}",
+            name, kv.0
+        ))
+    } else if let Some(other) = find_undef_comb(rhs.clone(), env) {
+        Err(format!(
+            "invalid definition of {}, it references unknown combinators, for exampe {}",
+            name, other
+        ))
+    } else {
+        Ok((name, rhs))
+    }
 }
 
 fn elim(lhs: SKI, rhs: SKI) -> SKI {
@@ -170,7 +232,7 @@ fn elim(lhs: SKI, rhs: SKI) -> SKI {
 }
 fn check_free_vars(rhs: SKI, bound: &HashSet<char>) -> Result<(), String> {
     match rhs {
-        S | K | I | Comb(_) => Ok(()),
+        S | K | I | PC | PN | Comb(_) => Ok(()),
         Var(v) if bound.contains(&v) => Ok(()),
         App(a, b) => check_free_vars(a.as_ref().clone(), bound)
             .and_then(|_| check_free_vars(b.as_ref().clone(), bound)),
@@ -178,6 +240,22 @@ fn check_free_vars(rhs: SKI, bound: &HashSet<char>) -> Result<(), String> {
             "Right hand side of definition must not contain free variable '{}'",
             x
         )),
+    }
+}
+
+/// Check expression for unknown combinators.
+fn find_undef_comb(rhs: SKI, env: &HashMap<String, SKI>) -> Option<String> {
+    match rhs {
+        S | K | I | PC | PN | Var(_) => None,
+        Comb(name) => {
+            if env.get(&name).is_none() {
+                Some(name)
+            } else {
+                None
+            }
+        }
+        App(a, b) => find_undef_comb(a.as_ref().clone(), env)
+            .or_else(|| find_undef_comb(b.as_ref().clone(), env)),
     }
 }
 
@@ -217,6 +295,8 @@ pub enum Command {
     Help,
     Load(String),
     Echo(String),
+    Clear,
+    Reload,
 }
 
 pub use Command::*;
@@ -230,7 +310,7 @@ pub fn p_command() -> GenericP<u8, Command, String> {
         .label("enter command")
         .and_then(|s| match s.as_str() {
             "help" => pure(true).map(|_| Help),
-            "list" => p_comb().optional().map(|r| match r {
+            "l" | "list" => p_comb().optional().map(|r| match r {
                 Some(Comb(n)) => List(n),
                 _ => ListAll,
             }),
@@ -238,6 +318,8 @@ pub fn p_command() -> GenericP<u8, Command, String> {
                 .label("expecting filename")
                 .map(Load),
             "echo" => take(|_c| true).label("type some text").map(Echo),
+            "c" | "clr" | "clear" => pure(true).map(|_| Clear),
+            "r" | "reload" => pure(true).map(|_| Reload),
             _ => fail("valid commands are help, list, load, save, echo"),
         });
     spaces()
@@ -252,6 +334,7 @@ pub fn p_command() -> GenericP<u8, Command, String> {
                     expect('?')
                         .map(move |_| Eval(ski_a.clone()))
                         .or(expect('=')
+                            .commit()
                             .then(spaces())
                             .then(ski::p_expr())
                             .map(move |x| Let(ski_c.clone(), x)))

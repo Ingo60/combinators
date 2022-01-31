@@ -11,6 +11,8 @@ pub enum SKI {
     S,
     K,
     I,
+    PC,
+    PN,
     /// variable
     Var(char),
     /// combinator
@@ -26,6 +28,8 @@ impl fmt::Display for SKI {
             S => write!(f, "S"),
             K => write!(f, "K"),
             I => write!(f, "I"),
+            PN => write!(f, "#"),
+            PC => write!(f, "."),
             Var(c) => write!(f, "{}", c),
             Comb(name) => {
                 let mut iter = name.chars();
@@ -74,14 +78,14 @@ impl SKI {
         let mut vs = Vec::new();
         self.unfolded(&mut vs);
         let mut n = 0;
-        while n < n_max && SKI::evalstep(&mut vs, hash) {
+        while n < n_max && SKI::evalstep(&mut vs, hash, false) {
             n += 1;
         }
         SKI::folded(&mut vs)
     }
 
     /// returns true if the vector was changed
-    fn evalstep(vs: &mut Vec<SKI>, hash: &HashMap<String, SKI>) -> bool {
+    fn evalstep(vs: &mut Vec<SKI>, hash: &HashMap<String, SKI>, side_effects: bool) -> bool {
         let some = vs.pop().unwrap();
         let n_args = vs.len();
         match some {
@@ -93,8 +97,8 @@ impl SKI {
                 vs.push(K);
                 false
             }
-            I if n_args < 1 => {
-                vs.push(I);
+            I | PC | PN if n_args < 1 => {
+                vs.push(some);
                 false
             }
             S => {
@@ -116,6 +120,40 @@ impl SKI {
             }
             I => {
                 // Ix = x  (but x is still on the stack, so we don't do anything)
+                true
+            }
+            PC | PN if !side_effects => {
+                vs.pop().unwrap();
+                vs.push(I);
+                true
+            }
+            PN => {
+                let mut n = vs.pop().unwrap().eval(hash);
+                vs.push(I);
+                let mut v = 0u64;
+                let y = hash.get("zero?").map(|x| x.eval(hash)).and_then(|z| {
+                    hash.get("pred").map(|x| x.eval(hash)).and_then(|p| {
+                        loop {
+                            let is_0 = z.clone().app(n.clone()).eval(hash);
+                            if is_0 == K.app(I) {
+                                v += 1;
+                                n = p.clone().app(n.clone());
+                            } else if is_0 == K {
+                                print!("{}", v);
+                                break;
+                            } else {
+                                eprintln!("{}{} is not a number{}", YELLOW, n.clone(), NORMAL);
+                                break;
+                            }
+                        }
+                        Some(S)
+                    })
+                });
+                if y.is_none() {
+                    eprintln!("{}[pred] or [zero?] are not defined.{}", YELLOW, NORMAL);
+                }
+                /*
+                 */
                 true
             }
             app @ App(_, _) => {
@@ -145,7 +183,7 @@ impl SKI {
         self.unfolded(&mut vs);
         let mut n_iter = 0;
         interruption::reset();
-        while SKI::evalstep(&mut vs, hash) {
+        while SKI::evalstep(&mut vs, hash, true) {
             n_iter += 1;
             if n_iter % (1024 * 1024) == 0 && interruption::was_interrupted() {
                 eprintln!("\x08\x08aborted");
@@ -185,12 +223,21 @@ impl SKI {
         }
     }
 
-    /// checks if expression contains variable 'v'
-    pub fn has(&self, v: char) -> bool {
+    /// checks if expression contains variable [v]
+    pub fn has_var(&self, v: char) -> bool {
         match self {
-            S | K | I | Comb(_) => false,
+            S | K | I | PC | PN | Comb(_) => false,
             Var(x) => v.eq(x),
-            App(a, b) => a.has(v) || b.has(v),
+            App(a, b) => a.has_var(v) || b.has_var(v),
+        }
+    }
+
+    /// check if expression contains combinator [name]
+    pub fn has_comb(&self, name: &str) -> bool {
+        match self {
+            S | K | I | PC | PN | Var(_) => false,
+            Comb(x) => x.eq(&name),
+            App(a, b) => a.has_comb(name) || b.has_comb(name),
         }
     }
 
@@ -213,9 +260,9 @@ impl SKI {
                 }
             }
             App(a, b) => match b.as_ref().clone() {
-                Var(x) if v == x && !a.has(v) => a.as_ref().clone(), /* by rule 3 */
-                _b if !self.has(v) => K.app(self.clone()),           /* by rule 2 */
-                b => S.app(a.eliminate(v)).app(b.eliminate(v)),      /* by rule 4 */
+                Var(x) if v == x && !a.has_var(v) => a.as_ref().clone(), /* by rule 3 */
+                _b if !self.has_var(v) => K.app(self.clone()),           /* by rule 2 */
+                b => S.app(a.eliminate(v)).app(b.eliminate(v)),          /* by rule 4 */
             },
             // self is not a variable and not of the form xy
             // This means that v cannot occur in it, hence rule 2
@@ -247,19 +294,25 @@ pub fn is_comb(c: char) -> bool {
     c.is_uppercase() || c.is_numeric() || c == '_'
 }
 
+/// Construct a parser that parses combinators
 pub fn p_comb() -> GenericP<u8, SKI, String> {
     let single = satisfy(is_comb).map(|c| Comb(c.to_string()));
+    let charcode = expect('\'')
+        .commit()
+        .then(satisfy(|_| true).label("character to encode"))
+        .before(expect('\''))
+        .map(|c| Comb(format!("{}", c as u32)));
     let brackets = expect('[')
         .commit()
-        // .map_err(|_| "enter combinator name".to_string())
-        .then(
-            take(|c| c != ']')
-                .guard(|name| name != "S" && name != "K" && name != "I")
-                .map_err(|_| "type the constructor name".to_string()),
-        )
+        .then(take(|c| c != ']').label("type constructor name").guard(
+            |name| name != "S" && name != "K" && name != "I" && name != "#" && name != ".",
+            |name| format!("\"{}\" is a reserved constructor name", name),
+        ))
         .before(expect(']'))
         .map(Comb);
-    brackets.or(single.label("combinator expected"))
+    brackets
+        .or(charcode)
+        .or(single.label("combinator expected"))
 }
 
 #[test]
@@ -276,13 +329,18 @@ pub fn test_p_comb() {
 
 pub fn p_atom() -> GenericP<u8, SKI, String> {
     spaces().then(
-        (expect('S').map(|_| S))
-            .or(expect('K').map(|_| K))
-            .or(expect('I').map(|_| I))
-            .or(p_comb())
-            .or(satisfy(|c| c.is_lowercase())
-                .map(Var)
-                .label("variable or combinator expected")),
+        (satisfy(|c| c == 'S' || c == 'K' || c == 'I' || c == '#' || c == '.').map(|c| match c {
+            'S' => S,
+            'K' => K,
+            'I' => I,
+            '#' => PN,
+            '.' => PC,
+            _ => panic!("satisfy {}?", c),
+        }))
+        .or(p_comb())
+        .or(satisfy(|c| c.is_lowercase())
+            .map(Var)
+            .label("variable or combinator expected")),
     )
 }
 

@@ -41,7 +41,7 @@ pub fn main() {
     println!("Welcome to this SKI-Interpreter. Type \":help\" for help.");
     loop {
         rl.set_helper(Some(ski_helper.clone()));
-        let readline = rl.readline("⌦ ");
+        let readline = rl.readline("=» ");
         match readline {
             Ok(line) => match p_command().parse_str(&line) {
                 Ok(cmd) => {
@@ -118,7 +118,8 @@ impl Hinter for SkiHelper {
                     .un_i(),
                 NORMAL
             )),
-            Ok(ListAll) | Ok(List(_)) | Ok(Help) | Ok(Load(_)) | Ok(Echo(_)) => None,
+            Ok(ListAll) | Ok(List(_)) | Ok(Help) | Ok(Load(_)) | Ok(Echo(_)) | Ok(Clear)
+            | Ok(Reload) => None,
             Err(s) => Some(format!("     {}{}{}", RED, s, NORMAL)),
         }
     }
